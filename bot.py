@@ -18,7 +18,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID = int(os.getenv("TG_CHAT_ID"))
+TG_CHAT_ID = int(os.getenv("TG_CHAT_ID", "-1003959930384"))
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "")

@@ -18,12 +18,20 @@ log = logging.getLogger(__name__)
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "8613977074:AAHgC5gZtmRuZugL8zF1mRiph4YZTWRxC8A")
 TG_CHAT_ID = int(os.getenv("TG_CHAT_ID", "-1003959930384"))
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
 RSI_OB = float(os.getenv("RSI_OVERBOUGHT", 70))
 RSI_OS = float(os.getenv("RSI_OVERSOLD", 30))
-TIMEFRAME = os.getenv("TIMEFRAME", "60")  # Bybit: 1,3,5,15,30,60,120,240,D
+TIMEFRAME = os.getenv("TIMEFRAME", "60")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
+
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
+    "DOGEUSDT", "SOLUSDT", "OPUSDT", "ARBUSDT", "SUIUSDT",
+    "AVAXUSDT", "DOTUSDT", "MATICUSDT", "LINKUSDT", "LTCUSDT",
+    "UNIUSDT", "ATOMUSDT", "NEARUSDT", "APTUSDT", "FILUSDT",
+    "INJUSDT", "STXUSDT", "RUNEUSDT", "SEIUSDT", "TIAUSDT",
+    "WLDUSDT", "BLURUSDT", "PENDLEUSDT", "ORDIUSDT", "ACEUSDT",
+]
 
 BYBIT_BASE = "https://api.bybit.com"
 
@@ -73,51 +81,52 @@ async def send_tg(bot: Bot, text: str):
 
 async def run_loop():
     bot = Bot(token=TG_BOT_TOKEN)
+    last_signals = {s: None for s in SYMBOLS}
 
     await send_tg(
         bot,
         f"<b>RSI Bot Started</b>\n"
-        f"Symbol: <code>{SYMBOL}</code>  TF: {TIMEFRAME}\n"
+        f"Symbols: <code>{len(SYMBOLS)} pairs</code>  TF: {TIMEFRAME}m\n"
         f"RSI OS: {RSI_OS} | OB: {RSI_OB}\n"
         f"Data: Bybit Public API\n"
         f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC]",
     )
 
-    last_signal = None
-
     while True:
-        try:
-            df = fetch_klines(SYMBOL, TIMEFRAME)
-            rsi = calc_rsi(df, RSI_PERIOD)
-            price = get_price(SYMBOL)
-            log.info("RSI=%.2f  price=%.2f  last_signal=%s", rsi, price, last_signal)
+        for symbol in SYMBOLS:
+            try:
+                df = fetch_klines(symbol, TIMEFRAME)
+                rsi = calc_rsi(df, RSI_PERIOD)
+                price = get_price(symbol)
+                log.info("%s RSI=%.2f price=%.2f", symbol, rsi, price)
 
-            if rsi <= RSI_OS and last_signal != "LONG":
-                last_signal = "LONG"
-                await send_tg(
-                    bot,
-                    f"🟢 <b>LONG SIGNAL — {SYMBOL}</b>\n"
-                    f"RSI: <code>{rsi}</code> (Oversold)\n"
-                    f"Price: <code>{price:.2f}</code>\n"
-                    f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC]",
-                )
+                if rsi <= RSI_OS and last_signals[symbol] != "LONG":
+                    last_signals[symbol] = "LONG"
+                    await send_tg(
+                        bot,
+                        f"🟢 <b>LONG SIGNAL — {symbol}</b>\n"
+                        f"RSI: <code>{rsi}</code> (Oversold ≤{RSI_OS})\n"
+                        f"Price: <code>{price:.4f}</code>\n"
+                        f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC]",
+                    )
 
-            elif rsi >= RSI_OB and last_signal != "SHORT":
-                last_signal = "SHORT"
-                await send_tg(
-                    bot,
-                    f"🔴 <b>SHORT SIGNAL — {SYMBOL}</b>\n"
-                    f"RSI: <code>{rsi}</code> (Overbought)\n"
-                    f"Price: <code>{price:.2f}</code>\n"
-                    f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC]",
-                )
+                elif rsi >= RSI_OB and last_signals[symbol] != "SHORT":
+                    last_signals[symbol] = "SHORT"
+                    await send_tg(
+                        bot,
+                        f"🔴 <b>SHORT SIGNAL — {symbol}</b>\n"
+                        f"RSI: <code>{rsi}</code> (Overbought ≥{RSI_OB})\n"
+                        f"Price: <code>{price:.4f}</code>\n"
+                        f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC]",
+                    )
 
-            elif RSI_OS < rsi < RSI_OB:
-                last_signal = None
+                elif RSI_OS < rsi < RSI_OB:
+                    last_signals[symbol] = None
 
-        except Exception as e:
-            log.error("Loop error: %s", e)
-            await send_tg(bot, f"<b>Bot Error</b>\n<code>{e}</code>")
+                await asyncio.sleep(0.5)
+
+            except Exception as e:
+                log.error("%s error: %s", symbol, e)
 
         await asyncio.sleep(CHECK_INTERVAL)
 

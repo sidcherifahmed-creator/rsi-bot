@@ -21,9 +21,9 @@ TG_CHAT_ID = int(os.getenv("TG_CHAT_ID", "-1003959930384"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
 RSI_OB = float(os.getenv("RSI_OVERBOUGHT", 70))
 RSI_OS = float(os.getenv("RSI_OVERSOLD", 30))
-TIMEFRAME = os.getenv("TIMEFRAME", "15")  # 15 minutes
+TIMEFRAME = os.getenv("TIMEFRAME", "15")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
-SL_BUFFER = float(os.getenv("SL_BUFFER", 0.005))  # 0.5%
+SL_BUFFER = float(os.getenv("SL_BUFFER", 0.005))
 
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
@@ -35,6 +35,9 @@ SYMBOLS = [
 ]
 
 BYBIT_BASE = "https://api.bybit.com"
+
+# active_trades = {symbol: {type, entry1, entry2, sl, tp1, tp2, tp1_hit}}
+active_trades = {}
 
 
 def fetch_klines(symbol: str, limit: int = 100) -> pd.DataFrame:
@@ -50,6 +53,13 @@ def fetch_klines(symbol: str, limit: int = 100) -> pd.DataFrame:
     return df
 
 
+def get_price(symbol: str) -> float:
+    url = f"{BYBIT_BASE}/v5/market/tickers"
+    r = requests.get(url, params={"category": "linear", "symbol": symbol}, timeout=10)
+    r.raise_for_status()
+    return float(r.json()["result"]["list"][0]["lastPrice"])
+
+
 def calc_rsi(df: pd.DataFrame, period: int) -> pd.Series:
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
@@ -59,56 +69,31 @@ def calc_rsi(df: pd.DataFrame, period: int) -> pd.Series:
 
 
 def calc_signal(df: pd.DataFrame, rsi: pd.Series) -> dict | None:
-    # آخر شمعة مغلقة = [-2] (الأخيرة [-1] لم تغلق بعد)
-    prev_rsi = rsi.iloc[-3]  # الشمعة قبل الأخيرة
-    last_rsi = rsi.iloc[-2]  # آخر شمعة مغلقة
+    prev_rsi = rsi.iloc[-3]
+    last_rsi = rsi.iloc[-2]
     last_close = df["close"].iloc[-2]
 
-    # SHORT: RSI كان فوق 70 ثم أغلق تحته
     if prev_rsi >= RSI_OB and last_rsi < RSI_OB:
-        # آخر ذيل قمة في آخر 10 شمعات
         recent = df.iloc[-12:-2]
         last_high_wick = recent["high"].max()
-
         sl = round(last_high_wick * (1 + SL_BUFFER), 6)
         sl_dist = sl - last_close
         tp1 = round(last_close - sl_dist, 6)
         tp2 = round(last_close - sl_dist * 2, 6)
         entry2 = round((last_close + last_high_wick) / 2, 6)
+        return {"type": "SHORT", "entry1": last_close, "entry2": entry2,
+                "sl": sl, "tp1": tp1, "tp2": tp2, "tp1_hit": False}
 
-        return {
-            "type": "SHORT",
-            "symbol": "",
-            "rsi": round(last_rsi, 2),
-            "entry1": last_close,
-            "entry2": entry2,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-        }
-
-    # LONG: RSI كان تحت 30 ثم أغلق فوقه
     if prev_rsi <= RSI_OS and last_rsi > RSI_OS:
-        # آخر ذيل قاع في آخر 10 شمعات
         recent = df.iloc[-12:-2]
         last_low_wick = recent["low"].min()
-
         sl = round(last_low_wick * (1 - SL_BUFFER), 6)
         sl_dist = last_close - sl
         tp1 = round(last_close + sl_dist, 6)
         tp2 = round(last_close + sl_dist * 2, 6)
         entry2 = round((last_close + last_low_wick) / 2, 6)
-
-        return {
-            "type": "LONG",
-            "symbol": "",
-            "rsi": round(last_rsi, 2),
-            "entry1": last_close,
-            "entry2": entry2,
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-        }
+        return {"type": "LONG", "entry1": last_close, "entry2": entry2,
+                "sl": sl, "tp1": tp1, "tp2": tp2, "tp1_hit": False}
 
     return None
 
@@ -121,49 +106,103 @@ async def send_tg(bot: Bot, text: str):
         log.error("TG error: %s", e)
 
 
+async def check_trade(bot: Bot, symbol: str, trade: dict, price: float):
+    t = trade["type"]
+
+    if t == "LONG":
+        # TP1
+        if not trade["tp1_hit"] and price >= trade["tp1"]:
+            trade["tp1_hit"] = True
+            await send_tg(bot,
+                f"✅ <b>TP1 HIT — {symbol}</b>\n"
+                f"Price: <code>{price}</code> | TP1: <code>{trade['tp1']}</code>\n"
+                f"نقل SL للدخول ✅")
+
+        # TP2
+        elif trade["tp1_hit"] and price >= trade["tp2"]:
+            await send_tg(bot,
+                f"🎯 <b>TP2 HIT — {symbol}</b>\n"
+                f"Price: <code>{price}</code> | TP2: <code>{trade['tp2']}</code>\n"
+                f"إغلاق الصفقة كاملاً 🏆")
+            del active_trades[symbol]
+
+        # SL
+        elif price <= trade["sl"]:
+            await send_tg(bot,
+                f"❌ <b>SL HIT — {symbol}</b>\n"
+                f"Price: <code>{price}</code> | SL: <code>{trade['sl']}</code>")
+            del active_trades[symbol]
+
+    elif t == "SHORT":
+        # TP1
+        if not trade["tp1_hit"] and price <= trade["tp1"]:
+            trade["tp1_hit"] = True
+            await send_tg(bot,
+                f"✅ <b>TP1 HIT — {symbol}</b>\n"
+                f"Price: <code>{price}</code> | TP1: <code>{trade['tp1']}</code>\n"
+                f"نقل SL للدخول ✅")
+
+        # TP2
+        elif trade["tp1_hit"] and price <= trade["tp2"]:
+            await send_tg(bot,
+                f"🎯 <b>TP2 HIT — {symbol}</b>\n"
+                f"Price: <code>{price}</code> | TP2: <code>{trade['tp2']}</code>\n"
+                f"إغلاق الصفقة كاملاً 🏆")
+            del active_trades[symbol]
+
+        # SL
+        elif price >= trade["sl"]:
+            await send_tg(bot,
+                f"❌ <b>SL HIT — {symbol}</b>\n"
+                f"Price: <code>{price}</code> | SL: <code>{trade['sl']}</code>")
+            del active_trades[symbol]
+
+
 async def run_loop():
     bot = Bot(token=TG_BOT_TOKEN)
-    last_signals = {s: None for s in SYMBOLS}
 
-    await send_tg(
-        bot,
+    await send_tg(bot,
         f"<b>RSI Bot Started ✅</b>\n"
         f"Symbols: <code>{len(SYMBOLS)} pairs</code>\n"
         f"Timeframe: <code>15m</code>\n"
         f"RSI OS: {RSI_OS} | OB: {RSI_OB}\n"
         f"SL Buffer: {SL_BUFFER*100}%\n"
-        f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC]",
-    )
+        f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC]")
 
     while True:
         for symbol in SYMBOLS:
             try:
-                df = fetch_klines(symbol)
-                rsi = calc_rsi(df, RSI_PERIOD)
-                signal = calc_signal(df, rsi)
+                price = get_price(symbol)
 
-                log.info("%s RSI=%.2f", symbol, rsi.iloc[-2])
+                # متابعة الصفقات المفتوحة
+                if symbol in active_trades:
+                    await check_trade(bot, symbol, active_trades[symbol], price)
+                    if symbol not in active_trades:
+                        await asyncio.sleep(0.3)
+                        continue
 
-                if signal and last_signals[symbol] != signal["type"]:
-                    last_signals[symbol] = signal["type"]
-                    emoji = "🟢" if signal["type"] == "LONG" else "🔴"
-                    await send_tg(
-                        bot,
-                        f"{emoji} <b>{signal['type']} SIGNAL — {symbol}</b>\n"
-                        f"RSI: <code>{signal['rsi']}</code>\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"Entry1 (Market): <code>{signal['entry1']}</code>\n"
-                        f"Entry2 (Limit):  <code>{signal['entry2']}</code>\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"TP1: <code>{signal['tp1']}</code>\n"
-                        f"TP2: <code>{signal['tp2']}</code>\n"
-                        f"SL:  <code>{signal['sl']}</code>\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"TF: 15m | [{datetime.utcnow().strftime('%H:%M')} UTC]",
-                    )
+                # البحث عن إشارات جديدة
+                if symbol not in active_trades:
+                    df = fetch_klines(symbol)
+                    rsi = calc_rsi(df, RSI_PERIOD)
+                    signal = calc_signal(df, rsi)
+                    log.info("%s RSI=%.2f price=%.4f", symbol, rsi.iloc[-2], price)
 
-                elif signal is None:
-                    last_signals[symbol] = None
+                    if signal:
+                        active_trades[symbol] = signal
+                        emoji = "🟢" if signal["type"] == "LONG" else "🔴"
+                        await send_tg(bot,
+                            f"{emoji} <b>{signal['type']} SIGNAL — {symbol}</b>\n"
+                            f"RSI: <code>{round(rsi.iloc[-2], 2)}</code>\n"
+                            f"━━━━━━━━━━━━━━━\n"
+                            f"Entry1 (Market): <code>{signal['entry1']}</code>\n"
+                            f"Entry2 (Limit):  <code>{signal['entry2']}</code>\n"
+                            f"━━━━━━━━━━━━━━━\n"
+                            f"TP1: <code>{signal['tp1']}</code>\n"
+                            f"TP2: <code>{signal['tp2']}</code>\n"
+                            f"SL:  <code>{signal['sl']}</code>\n"
+                            f"━━━━━━━━━━━━━━━\n"
+                            f"TF: 15m | [{datetime.utcnow().strftime('%H:%M')} UTC]")
 
                 await asyncio.sleep(0.5)
 

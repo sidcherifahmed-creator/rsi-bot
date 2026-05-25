@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -24,6 +24,7 @@ RSI_OS = float(os.getenv("RSI_OVERSOLD", 30))
 TIMEFRAME = os.getenv("TIMEFRAME", "15")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
 SL_BUFFER = float(os.getenv("SL_BUFFER", 0.005))
+REPORT_HOUR = int(os.getenv("REPORT_HOUR", 20))  # ساعة التقرير (UTC)
 
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
@@ -38,6 +39,15 @@ BYBIT_BASE = "https://api.bybit.com"
 
 # active_trades = {symbol: {type, entry1, entry2, sl, tp1, tp2, tp1_hit}}
 active_trades = {}
+
+# daily stats
+daily_stats = {
+    "wins": [],      # [(symbol, type)]
+    "losses": [],    # [(symbol, type)]
+    "opened": [],    # [(symbol, type)]
+}
+
+last_report_date = None
 
 
 def fetch_klines(symbol: str, limit: int = 100) -> pd.DataFrame:
@@ -106,11 +116,45 @@ async def send_tg(bot: Bot, text: str):
         log.error("TG error: %s", e)
 
 
+async def send_daily_report(bot: Bot):
+    now = datetime.now(timezone.utc)
+    opened = daily_stats["opened"]
+    wins = daily_stats["wins"]
+    losses = daily_stats["losses"]
+    open_now = list(active_trades.keys())
+
+    wins_text = "\n".join([f"  ✅ {s} ({t})" for s, t in wins]) or "  —"
+    losses_text = "\n".join([f"  ❌ {s} ({t})" for s, t in losses]) or "  —"
+    open_text = "\n".join([f"  🔄 {s} ({active_trades[s]['type']})" for s in open_now]) or "  —"
+
+    report = (
+        f"📊 <b>التقرير اليومي — Capitex RSI Bot</b>\n"
+        f"📅 {now.strftime('%Y-%m-%d')}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📈 إجمالي الإشارات: <b>{len(opened)}</b>\n"
+        f"✅ رابحة (TP2): <b>{len(wins)}</b>\n"
+        f"❌ خاسرة (SL): <b>{len(losses)}</b>\n"
+        f"🔄 مفتوحة الآن: <b>{len(open_now)}</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"<b>الرابحة:</b>\n{wins_text}\n\n"
+        f"<b>الخاسرة:</b>\n{losses_text}\n\n"
+        f"<b>المفتوحة:</b>\n{open_text}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"[{now.strftime('%H:%M')} UTC]"
+    )
+
+    await send_tg(bot, report)
+
+    # إعادة تعيين الإحصاء اليومي
+    daily_stats["wins"].clear()
+    daily_stats["losses"].clear()
+    daily_stats["opened"].clear()
+
+
 async def check_trade(bot: Bot, symbol: str, trade: dict, price: float):
     t = trade["type"]
 
     if t == "LONG":
-        # TP1
         if not trade["tp1_hit"] and price >= trade["tp1"]:
             trade["tp1_hit"] = True
             await send_tg(bot,
@@ -118,23 +162,22 @@ async def check_trade(bot: Bot, symbol: str, trade: dict, price: float):
                 f"Price: <code>{price}</code> | TP1: <code>{trade['tp1']}</code>\n"
                 f"نقل SL للدخول ✅")
 
-        # TP2
         elif trade["tp1_hit"] and price >= trade["tp2"]:
             await send_tg(bot,
                 f"🎯 <b>TP2 HIT — {symbol}</b>\n"
                 f"Price: <code>{price}</code> | TP2: <code>{trade['tp2']}</code>\n"
                 f"إغلاق الصفقة كاملاً 🏆")
+            daily_stats["wins"].append((symbol, t))
             del active_trades[symbol]
 
-        # SL
         elif price <= trade["sl"]:
             await send_tg(bot,
                 f"❌ <b>SL HIT — {symbol}</b>\n"
                 f"Price: <code>{price}</code> | SL: <code>{trade['sl']}</code>")
+            daily_stats["losses"].append((symbol, t))
             del active_trades[symbol]
 
     elif t == "SHORT":
-        # TP1
         if not trade["tp1_hit"] and price <= trade["tp1"]:
             trade["tp1_hit"] = True
             await send_tg(bot,
@@ -142,23 +185,24 @@ async def check_trade(bot: Bot, symbol: str, trade: dict, price: float):
                 f"Price: <code>{price}</code> | TP1: <code>{trade['tp1']}</code>\n"
                 f"نقل SL للدخول ✅")
 
-        # TP2
         elif trade["tp1_hit"] and price <= trade["tp2"]:
             await send_tg(bot,
                 f"🎯 <b>TP2 HIT — {symbol}</b>\n"
                 f"Price: <code>{price}</code> | TP2: <code>{trade['tp2']}</code>\n"
                 f"إغلاق الصفقة كاملاً 🏆")
+            daily_stats["wins"].append((symbol, t))
             del active_trades[symbol]
 
-        # SL
         elif price >= trade["sl"]:
             await send_tg(bot,
                 f"❌ <b>SL HIT — {symbol}</b>\n"
                 f"Price: <code>{price}</code> | SL: <code>{trade['sl']}</code>")
+            daily_stats["losses"].append((symbol, t))
             del active_trades[symbol]
 
 
 async def run_loop():
+    global last_report_date
     bot = Bot(token=TG_BOT_TOKEN)
 
     await send_tg(bot,
@@ -166,22 +210,27 @@ async def run_loop():
         f"Symbols: <code>{len(SYMBOLS)} pairs</code>\n"
         f"Timeframe: <code>15m</code>\n"
         f"RSI OS: {RSI_OS} | OB: {RSI_OB}\n"
-        f"SL Buffer: {SL_BUFFER*100}%\n"
-        f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC]")
+        f"تقرير يومي: {REPORT_HOUR}:00 UTC\n"
+        f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC]")
 
     while True:
+        now = datetime.now(timezone.utc)
+
+        # إرسال التقرير اليومي
+        if now.hour == REPORT_HOUR and now.date() != last_report_date:
+            last_report_date = now.date()
+            await send_daily_report(bot)
+
         for symbol in SYMBOLS:
             try:
                 price = get_price(symbol)
 
-                # متابعة الصفقات المفتوحة
                 if symbol in active_trades:
                     await check_trade(bot, symbol, active_trades[symbol], price)
                     if symbol not in active_trades:
                         await asyncio.sleep(0.3)
                         continue
 
-                # البحث عن إشارات جديدة
                 if symbol not in active_trades:
                     df = fetch_klines(symbol)
                     rsi = calc_rsi(df, RSI_PERIOD)
@@ -190,6 +239,7 @@ async def run_loop():
 
                     if signal:
                         active_trades[symbol] = signal
+                        daily_stats["opened"].append((symbol, signal["type"]))
                         emoji = "🟢" if signal["type"] == "LONG" else "🔴"
                         await send_tg(bot,
                             f"{emoji} <b>{signal['type']} SIGNAL — {symbol}</b>\n"
@@ -202,7 +252,7 @@ async def run_loop():
                             f"TP2: <code>{signal['tp2']}</code>\n"
                             f"SL:  <code>{signal['sl']}</code>\n"
                             f"━━━━━━━━━━━━━━━\n"
-                            f"TF: 15m | [{datetime.utcnow().strftime('%H:%M')} UTC]")
+                            f"TF: 15m | [{now.strftime('%H:%M')} UTC]")
 
                 await asyncio.sleep(0.5)
 

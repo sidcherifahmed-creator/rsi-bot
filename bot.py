@@ -24,7 +24,7 @@ RSI_OS = float(os.getenv("RSI_OVERSOLD", 30))
 TIMEFRAME = os.getenv("TIMEFRAME", "15")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
 SL_BUFFER = float(os.getenv("SL_BUFFER", 0.005))
-REPORT_HOUR = int(os.getenv("REPORT_HOUR", 20))  # ساعة التقرير (UTC)
+REPORT_HOUR = int(os.getenv("REPORT_HOUR", 20))
 
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
@@ -37,14 +37,12 @@ SYMBOLS = [
 
 BYBIT_BASE = "https://api.bybit.com"
 
-# active_trades = {symbol: {type, entry1, entry2, sl, tp1, tp2, tp1_hit}}
 active_trades = {}
 
-# daily stats
 daily_stats = {
-    "wins": [],      # [(symbol, type)]
-    "losses": [],    # [(symbol, type)]
-    "opened": [],    # [(symbol, type)]
+    "wins": [],    # {symbol, type, entry, tp2, sl, pct_tp1, pct_tp2, pct_sl}
+    "losses": [],
+    "opened": [],
 }
 
 last_report_date = None
@@ -78,6 +76,13 @@ def calc_rsi(df: pd.DataFrame, period: int) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def calc_pct(entry, target, direction):
+    if direction == "LONG":
+        return round((target - entry) / entry * 100, 2)
+    else:
+        return round((entry - target) / entry * 100, 2)
+
+
 def calc_signal(df: pd.DataFrame, rsi: pd.Series) -> dict | None:
     prev_rsi = rsi.iloc[-3]
     last_rsi = rsi.iloc[-2]
@@ -91,8 +96,12 @@ def calc_signal(df: pd.DataFrame, rsi: pd.Series) -> dict | None:
         tp1 = round(last_close - sl_dist, 6)
         tp2 = round(last_close - sl_dist * 2, 6)
         entry2 = round((last_close + last_high_wick) / 2, 6)
+        pct_tp1 = calc_pct(last_close, tp1, "SHORT")
+        pct_tp2 = calc_pct(last_close, tp2, "SHORT")
+        pct_sl = calc_pct(last_close, sl, "SHORT")
         return {"type": "SHORT", "entry1": last_close, "entry2": entry2,
-                "sl": sl, "tp1": tp1, "tp2": tp2, "tp1_hit": False}
+                "sl": sl, "tp1": tp1, "tp2": tp2, "tp1_hit": False,
+                "pct_tp1": pct_tp1, "pct_tp2": pct_tp2, "pct_sl": pct_sl}
 
     if prev_rsi <= RSI_OS and last_rsi > RSI_OS:
         recent = df.iloc[-12:-2]
@@ -102,8 +111,12 @@ def calc_signal(df: pd.DataFrame, rsi: pd.Series) -> dict | None:
         tp1 = round(last_close + sl_dist, 6)
         tp2 = round(last_close + sl_dist * 2, 6)
         entry2 = round((last_close + last_low_wick) / 2, 6)
+        pct_tp1 = calc_pct(last_close, tp1, "LONG")
+        pct_tp2 = calc_pct(last_close, tp2, "LONG")
+        pct_sl = calc_pct(last_close, sl, "LONG")
         return {"type": "LONG", "entry1": last_close, "entry2": entry2,
-                "sl": sl, "tp1": tp1, "tp2": tp2, "tp1_hit": False}
+                "sl": sl, "tp1": tp1, "tp2": tp2, "tp1_hit": False,
+                "pct_tp1": pct_tp1, "pct_tp2": pct_tp2, "pct_sl": pct_sl}
 
     return None
 
@@ -118,34 +131,51 @@ async def send_tg(bot: Bot, text: str):
 
 async def send_daily_report(bot: Bot):
     now = datetime.now(timezone.utc)
-    opened = daily_stats["opened"]
     wins = daily_stats["wins"]
     losses = daily_stats["losses"]
+    opened = daily_stats["opened"]
     open_now = list(active_trades.keys())
 
-    wins_text = "\n".join([f"  ✅ {s} ({t})" for s, t in wins]) or "  —"
-    losses_text = "\n".join([f"  ❌ {s} ({t})" for s, t in losses]) or "  —"
-    open_text = "\n".join([f"  🔄 {s} ({active_trades[s]['type']})" for s in open_now]) or "  —"
+    total = len(wins) + len(losses)
+    win_rate = round(len(wins) / total * 100, 1) if total > 0 else 0
+
+    wins_text = ""
+    for w in wins:
+        wins_text += f"  ✅ {w['symbol']} ({w['type']}) → TP2 <b>+{w['pct_tp2']}%</b>\n"
+    if not wins_text:
+        wins_text = "  —\n"
+
+    losses_text = ""
+    for l in losses:
+        losses_text += f"  ❌ {l['symbol']} ({l['type']}) → SL <b>-{abs(l['pct_sl'])}%</b>\n"
+    if not losses_text:
+        losses_text = "  —\n"
+
+    open_text = ""
+    for s in open_now:
+        t = active_trades[s]
+        open_text += f"  🔄 {s} ({t['type']}) | TP1: {t['pct_tp1']}% | TP2: {t['pct_tp2']}% | SL: -{abs(t['pct_sl'])}%\n"
+    if not open_text:
+        open_text = "  —\n"
 
     report = (
         f"📊 <b>التقرير اليومي — Capitex RSI Bot</b>\n"
         f"📅 {now.strftime('%Y-%m-%d')}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📈 إجمالي الإشارات: <b>{len(opened)}</b>\n"
-        f"✅ رابحة (TP2): <b>{len(wins)}</b>\n"
-        f"❌ خاسرة (SL): <b>{len(losses)}</b>\n"
+        f"✅ رابحة: <b>{len(wins)}</b> | ❌ خاسرة: <b>{len(losses)}</b>\n"
         f"🔄 مفتوحة الآن: <b>{len(open_now)}</b>\n"
+        f"🎯 Win Rate: <b>{win_rate}%</b>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"<b>الرابحة:</b>\n{wins_text}\n\n"
-        f"<b>الخاسرة:</b>\n{losses_text}\n\n"
-        f"<b>المفتوحة:</b>\n{open_text}\n"
+        f"<b>الرابحة:</b>\n{wins_text}\n"
+        f"<b>الخاسرة:</b>\n{losses_text}\n"
+        f"<b>المفتوحة:</b>\n{open_text}"
         f"━━━━━━━━━━━━━━━\n"
         f"[{now.strftime('%H:%M')} UTC]"
     )
 
     await send_tg(bot, report)
 
-    # إعادة تعيين الإحصاء اليومي
     daily_stats["wins"].clear()
     daily_stats["losses"].clear()
     daily_stats["opened"].clear()
@@ -159,22 +189,22 @@ async def check_trade(bot: Bot, symbol: str, trade: dict, price: float):
             trade["tp1_hit"] = True
             await send_tg(bot,
                 f"✅ <b>TP1 HIT — {symbol}</b>\n"
-                f"Price: <code>{price}</code> | TP1: <code>{trade['tp1']}</code>\n"
+                f"Price: <code>{price}</code> | TP1: <code>{trade['tp1']}</code> (+{trade['pct_tp1']}%)\n"
                 f"نقل SL للدخول ✅")
 
         elif trade["tp1_hit"] and price >= trade["tp2"]:
             await send_tg(bot,
                 f"🎯 <b>TP2 HIT — {symbol}</b>\n"
-                f"Price: <code>{price}</code> | TP2: <code>{trade['tp2']}</code>\n"
+                f"Price: <code>{price}</code> | TP2: <code>{trade['tp2']}</code> (+{trade['pct_tp2']}%)\n"
                 f"إغلاق الصفقة كاملاً 🏆")
-            daily_stats["wins"].append((symbol, t))
+            daily_stats["wins"].append({**trade, "symbol": symbol})
             del active_trades[symbol]
 
         elif price <= trade["sl"]:
             await send_tg(bot,
                 f"❌ <b>SL HIT — {symbol}</b>\n"
-                f"Price: <code>{price}</code> | SL: <code>{trade['sl']}</code>")
-            daily_stats["losses"].append((symbol, t))
+                f"Price: <code>{price}</code> | SL: <code>{trade['sl']}</code> (-{abs(trade['pct_sl'])}%)")
+            daily_stats["losses"].append({**trade, "symbol": symbol})
             del active_trades[symbol]
 
     elif t == "SHORT":
@@ -182,22 +212,22 @@ async def check_trade(bot: Bot, symbol: str, trade: dict, price: float):
             trade["tp1_hit"] = True
             await send_tg(bot,
                 f"✅ <b>TP1 HIT — {symbol}</b>\n"
-                f"Price: <code>{price}</code> | TP1: <code>{trade['tp1']}</code>\n"
+                f"Price: <code>{price}</code> | TP1: <code>{trade['tp1']}</code> (+{trade['pct_tp1']}%)\n"
                 f"نقل SL للدخول ✅")
 
         elif trade["tp1_hit"] and price <= trade["tp2"]:
             await send_tg(bot,
                 f"🎯 <b>TP2 HIT — {symbol}</b>\n"
-                f"Price: <code>{price}</code> | TP2: <code>{trade['tp2']}</code>\n"
+                f"Price: <code>{price}</code> | TP2: <code>{trade['tp2']}</code> (+{trade['pct_tp2']}%)\n"
                 f"إغلاق الصفقة كاملاً 🏆")
-            daily_stats["wins"].append((symbol, t))
+            daily_stats["wins"].append({**trade, "symbol": symbol})
             del active_trades[symbol]
 
         elif price >= trade["sl"]:
             await send_tg(bot,
                 f"❌ <b>SL HIT — {symbol}</b>\n"
-                f"Price: <code>{price}</code> | SL: <code>{trade['sl']}</code>")
-            daily_stats["losses"].append((symbol, t))
+                f"Price: <code>{price}</code> | SL: <code>{trade['sl']}</code> (-{abs(trade['pct_sl'])}%)")
+            daily_stats["losses"].append({**trade, "symbol": symbol})
             del active_trades[symbol]
 
 
@@ -216,7 +246,6 @@ async def run_loop():
     while True:
         now = datetime.now(timezone.utc)
 
-        # إرسال التقرير اليومي
         if now.hour == REPORT_HOUR and now.date() != last_report_date:
             last_report_date = now.date()
             await send_daily_report(bot)
@@ -248,9 +277,9 @@ async def run_loop():
                             f"Entry1 (Market): <code>{signal['entry1']}</code>\n"
                             f"Entry2 (Limit):  <code>{signal['entry2']}</code>\n"
                             f"━━━━━━━━━━━━━━━\n"
-                            f"TP1: <code>{signal['tp1']}</code>\n"
-                            f"TP2: <code>{signal['tp2']}</code>\n"
-                            f"SL:  <code>{signal['sl']}</code>\n"
+                            f"TP1: <code>{signal['tp1']}</code> (+{signal['pct_tp1']}%)\n"
+                            f"TP2: <code>{signal['tp2']}</code> (+{signal['pct_tp2']}%)\n"
+                            f"SL:  <code>{signal['sl']}</code> (-{abs(signal['pct_sl'])}%)\n"
                             f"━━━━━━━━━━━━━━━\n"
                             f"TF: 15m | [{now.strftime('%H:%M')} UTC]")
 

@@ -21,7 +21,7 @@ TG_CHAT_ID = int(os.getenv("TG_CHAT_ID", "-1003959930384"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
 RSI_OB = float(os.getenv("RSI_OVERBOUGHT", 70))
 RSI_OS = float(os.getenv("RSI_OVERSOLD", 30))
-TIMEFRAME = os.getenv("TIMEFRAME", "15")
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
 SL_BUFFER = float(os.getenv("SL_BUFFER", 0.005))
 REPORT_HOUR = int(os.getenv("REPORT_HOUR", 20))
@@ -35,12 +35,13 @@ SYMBOLS = [
     "WLDUSDT", "BLURUSDT", "PENDLEUSDT", "ORDIUSDT", "ACEUSDT",
 ]
 
-BYBIT_BASE = "https://api.bybit.com"
+# Binance Public API — لا يحتاج auth ولا يحظر IPs
+BINANCE_BASE = "https://fapi.binance.com"
 
 active_trades = {}
 
 daily_stats = {
-    "wins": [],    # {symbol, type, entry, tp2, sl, pct_tp1, pct_tp2, pct_sl}
+    "wins": [],
     "losses": [],
     "opened": [],
 }
@@ -49,23 +50,26 @@ last_report_date = None
 
 
 def fetch_klines(symbol: str, limit: int = 100) -> pd.DataFrame:
-    url = f"{BYBIT_BASE}/v5/market/kline"
-    params = {"category": "linear", "symbol": symbol, "interval": TIMEFRAME, "limit": limit}
+    url = f"{BINANCE_BASE}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": TIMEFRAME, "limit": limit}
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    rows = r.json()["result"]["list"]
-    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "turnover"])
+    rows = r.json()
+    df = pd.DataFrame(rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col])
-    df = df.iloc[::-1].reset_index(drop=True)
     return df
 
 
 def get_price(symbol: str) -> float:
-    url = f"{BYBIT_BASE}/v5/market/tickers"
-    r = requests.get(url, params={"category": "linear", "symbol": symbol}, timeout=10)
+    url = f"{BINANCE_BASE}/fapi/v1/ticker/price"
+    r = requests.get(url, params={"symbol": symbol}, timeout=10)
     r.raise_for_status()
-    return float(r.json()["result"]["list"][0]["lastPrice"])
+    return float(r.json()["price"])
 
 
 def calc_rsi(df: pd.DataFrame, period: int) -> pd.Series:
@@ -238,8 +242,9 @@ async def run_loop():
     await send_tg(bot,
         f"<b>RSI Bot Started ✅</b>\n"
         f"Symbols: <code>{len(SYMBOLS)} pairs</code>\n"
-        f"Timeframe: <code>15m</code>\n"
+        f"Timeframe: <code>{TIMEFRAME}</code>\n"
         f"RSI OS: {RSI_OS} | OB: {RSI_OB}\n"
+        f"Data: Binance Futures Public API\n"
         f"تقرير يومي: {REPORT_HOUR}:00 UTC\n"
         f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC]")
 
@@ -281,7 +286,7 @@ async def run_loop():
                             f"TP2: <code>{signal['tp2']}</code> (+{signal['pct_tp2']}%)\n"
                             f"SL:  <code>{signal['sl']}</code> (-{abs(signal['pct_sl'])}%)\n"
                             f"━━━━━━━━━━━━━━━\n"
-                            f"TF: 15m | [{now.strftime('%H:%M')} UTC]")
+                            f"TF: {TIMEFRAME} | [{now.strftime('%H:%M')} UTC]")
 
                 await asyncio.sleep(0.5)
 

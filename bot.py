@@ -21,12 +21,13 @@ TG_CHAT_ID = int(os.getenv("TG_CHAT_ID", "-1003959930384"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", 14))
 RSI_OB = float(os.getenv("RSI_OVERBOUGHT", 70))
 RSI_OS = float(os.getenv("RSI_OVERSOLD", 30))
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")  # OKX: 1m,3m,5m,15m,30m,1H,4H,1D
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
 SL_BUFFER = float(os.getenv("SL_BUFFER", 0.005))
 REPORT_HOUR = int(os.getenv("REPORT_HOUR", 20))
 
-SYMBOLS = [
+# OKX يستخدم تنسيق BTC-USDT-SWAP للعقود الدائمة
+SYMBOLS_RAW = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
     "DOGEUSDT", "SOLUSDT", "OPUSDT", "ARBUSDT", "SUIUSDT",
     "AVAXUSDT", "DOTUSDT", "POLUSDT", "LINKUSDT", "LTCUSDT",
@@ -35,8 +36,16 @@ SYMBOLS = [
     "WLDUSDT", "BLURUSDT", "PENDLEUSDT", "ORDIUSDT", "ACEUSDT",
 ]
 
-# Binance Public API — لا يحتاج auth ولا يحظر IPs
-BINANCE_BASE = "https://fapi.binance.com"
+
+def to_okx_symbol(s: str) -> str:
+    # BTCUSDT → BTC-USDT-SWAP
+    base = s.replace("USDT", "")
+    return f"{base}-USDT-SWAP"
+
+
+SYMBOLS = SYMBOLS_RAW  # نحتفظ بالأسماء الأصلية للعرض
+
+OKX_BASE = "https://www.okx.com"
 
 active_trades = {}
 
@@ -50,26 +59,34 @@ last_report_date = None
 
 
 def fetch_klines(symbol: str, limit: int = 100) -> pd.DataFrame:
-    url = f"{BINANCE_BASE}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": TIMEFRAME, "limit": limit}
+    okx_sym = to_okx_symbol(symbol)
+    url = f"{OKX_BASE}/api/v5/market/candles"
+    params = {"instId": okx_sym, "bar": TIMEFRAME, "limit": str(limit)}
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    rows = r.json()
+    data = r.json()
+    rows = data.get("data", [])
+    if not rows:
+        raise ValueError(f"No data for {symbol}")
     df = pd.DataFrame(rows, columns=[
         "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
+        "volume_ccy", "volume_quote", "confirm"
     ])
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col])
+    df = df.iloc[::-1].reset_index(drop=True)  # OKX يرسل الأحدث أولاً
     return df
 
 
 def get_price(symbol: str) -> float:
-    url = f"{BINANCE_BASE}/fapi/v1/ticker/price"
-    r = requests.get(url, params={"symbol": symbol}, timeout=10)
+    okx_sym = to_okx_symbol(symbol)
+    url = f"{OKX_BASE}/api/v5/market/ticker"
+    r = requests.get(url, params={"instId": okx_sym}, timeout=10)
     r.raise_for_status()
-    return float(r.json()["price"])
+    data = r.json()["data"]
+    if not data:
+        raise ValueError(f"No price for {symbol}")
+    return float(data[0]["last"])
 
 
 def calc_rsi(df: pd.DataFrame, period: int) -> pd.Series:
@@ -244,7 +261,7 @@ async def run_loop():
         f"Symbols: <code>{len(SYMBOLS)} pairs</code>\n"
         f"Timeframe: <code>{TIMEFRAME}</code>\n"
         f"RSI OS: {RSI_OS} | OB: {RSI_OB}\n"
-        f"Data: Binance Futures Public API\n"
+        f"Data: OKX Public API\n"
         f"تقرير يومي: {REPORT_HOUR}:00 UTC\n"
         f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC]")
 
